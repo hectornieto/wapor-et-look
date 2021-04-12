@@ -12,10 +12,12 @@ high-quality NDVI time-series data set based on the Savitzky-Golay filter.
 
 
 import numpy as np
+import pandas as pd
 
 from numba import jit
 from scipy import interpolate
 from scipy.signal import savgol_filter
+from tqdm import tqdm
 
 def _interpolate_1d(data):
     # we need at least 2 non-nan elements
@@ -30,12 +32,12 @@ def _interpolate_1d(data):
                                    fill_value=np.nan,
                                    bounds_error=False)
 
-    yinterp = finterp(np.arange(data.shape[0]))
+    data = finterp(np.arange(data.shape[0]))
 
-    return yinterp
+    return data
 
 
-@jit
+# @jit
 def _prepare_smoothing(N0):
     # long term change trend fitting:
     m = list(np.array([4, 5, 6, 7]) * 2 + 1)
@@ -63,7 +65,7 @@ def _prepare_smoothing(N0):
     return Ntr, W
 
 
-@jit
+# @jit
 def _recursive_smoothing(N0, Ntr, W, niter=0):
     max_iter = 5
     ndvi_stopping_difference = 0.05
@@ -84,7 +86,7 @@ def _recursive_smoothing(N0, Ntr, W, niter=0):
     return N1
 
 
-@jit
+# @jit
 def _savgol_reconstruct_1d(N0):
 
     # dont smooth if all nan
@@ -122,3 +124,80 @@ def savgol_reconstruct(data, axis=0, invert=False):
         data_interp = data_interp * -1
 
     return data_recons, data_interp
+
+
+def interpolate_and_reconstruct(timeseries, dates):
+    timeseries = temporal_interpolate(timeseries, dates)
+    timeseries = _savgol_reconstruct_1d(timeseries.reshape(-1))
+    return timeseries
+
+
+def temporal_interpolate(timeseries, dates):
+
+    timeseries = pd.DataFrame(timeseries, index=pd.to_datetime(dates))
+    timeseries = timeseries.interpolate(method="time",
+                                        axis=0,
+                                        limit_direction="both").to_numpy()
+
+    return timeseries
+
+
+def savgol_reconstruct_optimized(data, dates):
+    """
+    :param data: np.array((t,y,x))
+    raster timeseries. Each image in timeseries is shape y,x.
+    :param dates: array_like(t)
+    List of Datetime objects
+
+    :return: y_smoothed: np.array(t,y,x)
+    """
+    print('interpolating and reconstructing...')
+    iijj = [(i, j) for i in range(data.shape[1]) for j in range(data.shape[2])]
+    for i, j in tqdm(iijj):
+        # we need at least 2 non-nan elements
+        if np.sum(~np.isnan(data[:, i, j])) < 2:
+            continue
+        data[:, i, j] = interpolate_and_reconstruct(data[:, i, j], dates)
+
+    return data
+
+
+def iterpolate_reconstruct(data, dates, slice_size=1e6):
+
+    dims = data.shape
+    data = data.reshape(data.shape[0], -1)
+    n_elements = data.shape[1]
+    indices = int(np.ceil(n_elements / slice_size))
+
+    for i in tqdm(range(indices)):
+        index = int(i * slice_size)
+        index_end = int(np.minimum(index + slice_size, data.shape[1]))
+
+        data[:, index: index_end] = temporal_interpolate(data[:, index: index_end],
+                                                         dates)
+
+    data = data.reshape(dims)
+    return data
+
+
+def savgol_reconstruct_vectorized(data, dates, slice_size=1e5):
+
+    dims = data.shape
+    data = data.reshape(data.shape[0], -1)
+    data_sg = data.copy()
+    n_elements = data.shape[1]
+    indices = int(np.ceil(n_elements / slice_size))
+
+    for i in tqdm(range(indices)):
+        index = int(i * slice_size)
+        index_end = int(np.minimum(index + slice_size, data.shape[1]))
+
+        data[:, index: index_end] = temporal_interpolate(data[:, index: index_end], dates)
+        data[:, index: index_end][np.isnan(data[:, index: index_end])] = 0
+        data_sg[:, index: index_end] = savgol_filter(data[:, index: index_end],
+                                                     axis=0, polyorder=3, window_length=5)
+
+    data = data.reshape(dims)
+    data_sg = data_sg.reshape(dims)
+    return data, data_sg
+
